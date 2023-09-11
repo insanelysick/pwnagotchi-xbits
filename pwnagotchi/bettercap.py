@@ -1,11 +1,12 @@
+import json
 import logging
 import requests
 import websockets
-import backoff
 
 from requests.auth import HTTPBasicAuth
-import asyncio  # Add asyncio for async functionality
-from time import sleep  # Add sleep function
+from time import sleep
+
+requests.adapters.DEFAULT_RETRIES = 5 # increase retries number
 
 
 def decode(r, verbose_errors=True):
@@ -23,8 +24,7 @@ def decode(r, verbose_errors=True):
 
 
 class Client(object):
-    def __init__(self, hostname='localhost', scheme='http', port=8081, username='user', password='pass',
-                 max_websockets=5):
+    def __init__(self, hostname='localhost', scheme='http', port=8081, username='user', password='pass'):
         self.hostname = hostname
         self.scheme = scheme
         self.port = port
@@ -33,45 +33,45 @@ class Client(object):
         self.url = "%s://%s:%d/api" % (scheme, hostname, port)
         self.websocket = "ws://%s:%s@%s:%d/api" % (username, password, hostname, port)
         self.auth = HTTPBasicAuth(username, password)
-        self.max_websockets = max_websockets
-        self.websocket_semaphore = asyncio.Semaphore(max_websockets)
 
-    # session takes optional argument to pull a sub-dictionary
-    #  ex.: "session/wifi", "session/ble"
-    def session(self, sess="session"):
-        r = requests.get("%s/%s" % (self.url, sess), auth=self.auth)
+    def session(self):
+        r = requests.get("%s/session" % self.url, auth=self.auth)
         return decode(r)
 
-    @backoff.on_exception(backoff.expo, requests.exceptions.ConnectionError, max_tries=10)
     async def start_websocket(self, consumer):
-        async with self.websocket_semaphore:
-            s = "%s/events" % self.websocket
+        s = "%s/events" % self.websocket
+
+        async with websockets.connect(s, ping_interval=60, ping_timeout=90) as ws:
+            # After the websocket connection is opened, loop waiting for messages
+            # Moved the websocket connection before the loop to avoid runaway websocket
+            # connections that were exhausting all possible TCP ports (ephemeral port exhaustion)
             while True:
                 try:
-                    async with websockets.connect(s, ping_interval=60, ping_timeout=90) as ws:
-                        async for msg in ws:
-                            try:
-                                await consumer(msg)
-                            except Exception as ex:
+                    async for msg in ws:
+                        try:
+                            await consumer(msg)
+                        except Exception as ex:
                                 logging.debug("Error while parsing event (%s)", ex)
-                except websockets.ConnectionClosedError:
-                    logging.debug("Lost websocket connection. Reconnecting...")
-                    await asyncio.sleep(5)  # Sleep for x seconds before reconnecting
-                except websockets.WebSocketException as wex:
-                    logging.debug("Websocket exception (%s)", wex)
-                    await asyncio.sleep(5)  # Sleep for x seconds before reconnecting
+                except websockets.exceptions.ConnectionClosedError:
+                    logging.error("Lost websocket connection. Reconnecting...")
+                    continue
+                except websockets.exceptions.WebSocketException as wex:
+                    logging.error("Websocket exception (%s)", wex)
+                    continue
+                except OSError as e:
+                    logging.error("Websocket OSError exception (%s) with parameter %s", e, s)
+                    continue
                 except Exception as e:
-                    logging.exception("Other error while opening websocket (%s) with parameter %s", e, s)
-                    await asyncio.sleep(5)  # Sleep for x seconds before reconnecting
+                    logging.error("Other exception (%s) with parameter %s", e, s)
+                    continue
 
-    @backoff.on_exception(backoff.expo, requests.exceptions.ConnectionError, max_tries=10)
     def run(self, command, verbose_errors=True):
-        for _ in range(0, 2):
+        for _ in range(0,2):
             try:
                 r = requests.post("%s/session" % self.url, auth=self.auth, json={'cmd': command})
             except requests.exceptions.ConnectionError as e:
                 logging.exception("Request connection error (%s) while running command (%s)", e, command)
-                sleep(1)  # Sleep for 1-s before trying a second time
+                sleep(1) # Sleep for 1-s before trying a second time
             else:
                 break
 
